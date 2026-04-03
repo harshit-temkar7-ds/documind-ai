@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DocuMind AI — Document Intelligence</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>"/>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ── Header ──────────────────────────────────────────── -->
+  <header class="header">
+    <a class="header-logo" href="/">
+      <div class="logo-icon">🧠</div>
+      <span class="logo-name">DocuMind AI</span>
+    </a>
+    <span class="logo-tag">RAG · Powered by LLM</span>
+
+    <div class="header-spacer"></div>
+
+    <div class="api-status">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">Checking...</span>
+    </div>
+
+    <a href="/docs" target="_blank"
+       style="margin-left:16px;font-size:12px;color:var(--blue);text-decoration:none;
+              padding:5px 12px;border:1px solid var(--blue-border);border-radius:20px;
+              background:var(--blue-light)">
+      API Docs ↗
+    </a>
+  </header>
+
+
+  <!-- ── Sidebar ─────────────────────────────────────────── -->
+  <aside class="sidebar">
+
+    <!-- Upload Section -->
+    <div>
+      <div class="section-title">Upload Document</div>
+      <div class="upload-area" id="uploadArea">
+        <input type="file" accept=".pdf" class="upload-input" id="uploadInput" />
+        <span class="upload-icon">📂</span>
+        <div class="upload-text">Drop PDF here or click to browse</div>
+        <div class="upload-sub">Supports PDF · Max 50MB</div>
+      </div>
+      <div class="upload-progress" id="uploadProgress">
+        <div class="progress-bar-wrap">
+          <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <div class="progress-label" id="progressLabel">Uploading...</div>
+      </div>
+    </div>
+
+    <!-- Documents Section -->
+    <div>
+      <div class="section-title">Knowledge Base</div>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">
+        Click a document to filter search scope
+      </div>
+      <div class="doc-list" id="docList">
+        <div class="empty-docs">📄 No documents yet.<br>Upload a PDF to get started.</div>
+      </div>
+    </div>
+
+    <!-- Sample Questions -->
+    <div>
+      <div class="section-title">Try These Questions</div>
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        <button onclick="askSample('What is the main topic of this document?')"
+          style="text-align:left;padding:8px 12px;background:var(--bg);border:1px solid var(--border);
+                 border-radius:var(--radius-md);cursor:pointer;font-size:12px;color:var(--text-secondary);
+                 transition:all 0.15s;font-family:var(--font-body);"
+          onmouseover="this.style.background='var(--bg-hover)'"
+          onmouseout="this.style.background='var(--bg)'">
+          💡 What is the main topic of this document?
+        </button>
+        <button onclick="askSample('Summarize the key findings in 3 bullet points.')"
+          style="text-align:left;padding:8px 12px;background:var(--bg);border:1px solid var(--border);
+                 border-radius:var(--radius-md);cursor:pointer;font-size:12px;color:var(--text-secondary);
+                 transition:all 0.15s;font-family:var(--font-body);"
+          onmouseover="this.style.background='var(--bg-hover)'"
+          onmouseout="this.style.background='var(--bg)'">
+          📋 Summarize the key findings in 3 bullet points.
+        </button>
+        <button onclick="askSample('What conclusions or recommendations are made?')"
+          style="text-align:left;padding:8px 12px;background:var(--bg);border:1px solid var(--border);
+                 border-radius:var(--radius-md);cursor:pointer;font-size:12px;color:var(--text-secondary);
+                 transition:all 0.15s;font-family:var(--font-body);"
+          onmouseover="this.style.background='var(--bg-hover)'"
+          onmouseout="this.style.background='var(--bg)'">
+          🎯 What conclusions or recommendations are made?
+        </button>
+      </div>
+    </div>
+
+    <!-- About -->
+    <div style="margin-top:auto;padding-top:16px;border-top:1px solid var(--border);">
+      <div style="font-size:11px;color:var(--text-muted);line-height:1.8;">
+        <div><strong style="color:var(--text-secondary)">Tech Stack</strong></div>
+        <div>📦 sentence-transformers</div>
+        <div>🗄️ ChromaDB (vector store)</div>
+        <div>⚡ Groq LLaMA3 (LLM)</div>
+        <div>🚀 FastAPI (backend)</div>
+        <div>🎨 HTML/CSS (frontend)</div>
+      </div>
+    </div>
+
+  </aside>
+
+
+  <!-- ── Main Chat Area ──────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Chat Messages -->
+    <div class="chat-area" id="chatArea">
+
+      <!-- Welcome Screen -->
+      <div class="welcome" id="welcome">
+        <span class="welcome-icon">🧠</span>
+        <h2>Ask anything about your documents</h2>
+        <p>
+          Upload a PDF and DocuMind AI will read, understand, and answer
+          your questions with exact citations from the source.
+        </p>
+
+        <div class="welcome-steps">
+          <div class="welcome-step">
+            <div class="step-num">1</div>
+            <div class="step-text">
+              <strong>Upload a PDF</strong> — Annual reports, research papers,
+              contracts, manuals. Any text-based PDF works.
+            </div>
+          </div>
+          <div class="welcome-step">
+            <div class="step-num">2</div>
+            <div class="step-text">
+              <strong>Wait for indexing</strong> — DocuMind splits the text into
+              chunks, generates embeddings, and stores them in a vector database.
+            </div>
+          </div>
+          <div class="welcome-step">
+            <div class="step-num">3</div>
+            <div class="step-text">
+              <strong>Ask questions</strong> — The RAG pipeline retrieves the most
+              relevant sections and uses an LLM to generate a cited answer.
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Doc Filter Bar -->
+    <div class="input-doc-filter" id="docFilter"></div>
+
+    <!-- Input Bar -->
+    <div class="input-bar">
+      <div class="input-wrap">
+        <textarea
+          id="queryInput"
+          class="query-input"
+          placeholder="Ask a question about your documents..."
+          rows="1"
+        ></textarea>
+        <button class="send-btn" id="sendBtn" title="Send (Enter)">➤</button>
+      </div>
+      <div class="input-hint">
+        Press <strong>Enter</strong> to send · <strong>Shift+Enter</strong> for new line ·
+        Click a document in the sidebar to filter scope
+      </div>
+    </div>
+
+  </main>
+
+</div><!-- /.app -->
+
+<!-- Toast Container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

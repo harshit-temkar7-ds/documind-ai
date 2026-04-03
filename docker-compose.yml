@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  documind:
+    build: .
+    container_name: documind_ai
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data          # persist uploads + vector store
+      - ./.env:/app/.env          # pass API keys
+    environment:
+      - VECTORSTORE_PATH=/app/data/vectorstore
+      - UPLOAD_FOLDER=/app/data/uploads
+    restart: unless-stopped
