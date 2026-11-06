@@ -1,17 +1,8 @@
----
-title: DocuMind AI
-emoji: 🧠
-colorFrom: blue
-colorTo: purple
-sdk: docker
-app_port: 8000
-pinned: false
----
-
 # DocuMind AI
 
 Ask questions about your PDFs and get answers with page-level citations.
 FastAPI + PyMuPDF + sentence-transformers + **FAISS** + ChromaDB + LangGraph + Groq.
+**Live demo:** https://huggingface.co/spaces/HarryDataScience/documind-ai
 
 ## Quick start
 
