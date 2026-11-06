@@ -2,11 +2,12 @@
 """RAG engine adapter that preserves DocuMind AI's existing API contract."""
 
 import time
+import re
 from dataclasses import dataclass
 from typing import List, Optional
 
 from backend.core import settings, get_logger
-from backend.services.rag_graph import get_rag_graph
+from backend.services.rag_graph import get_rag_graph, is_refusal
 
 logger = get_logger(__name__)
 
@@ -31,6 +32,32 @@ class RAGResponse:
     chunks_retrieved: int
     is_grounded: bool
     confidence: str
+
+
+# Models write citations in different styles: [Source 2], 【Source 2】, *Source 2*, (Source 2)
+_CITATION_NUMBER = re.compile(r"\bSource\s+(\d+)\b", flags=re.I)
+_FANCY_BRACKETS = re.compile(r"[\[【［]\s*(Source\s+\d+)\s*[\]】］]", flags=re.I)
+
+
+def normalize_citations(answer: str) -> str:
+    """Rewrite 【Source 2】-style markers to the standard [Source 2]."""
+    return _FANCY_BRACKETS.sub(r"[\1]", answer or "")
+
+
+def select_cited_chunks(answer: str, chunks: list) -> list:
+    """Return chunks the answer cites as 'Source N'; fall back to all chunks.
+
+    The fallback also covers answers that cite no source or cite a number that
+    does not exist, so a real answer never ends up with zero sources.
+    """
+    cited = {int(n) for n in _CITATION_NUMBER.findall(answer or "")}
+    picked = [chunk for index, chunk in enumerate(chunks, 1) if index in cited]
+    return picked or list(chunks)
+
+
+def excerpt(text: str, limit: int = 300) -> str:
+    """Shorten a chunk for display in the sources list."""
+    return text[:limit] + "..." if len(text) > limit else text
 
 
 class RAGEngine:
@@ -70,6 +97,8 @@ class RAGEngine:
         question: str,
         doc_ids: Optional[List[str]] = None,
         top_k: Optional[int] = None,
+        history: Optional[list] = None,
+        owner_id: Optional[str] = None,
     ) -> RAGResponse:
         """Execute LangGraph and return the existing response structure."""
         start_time = time.perf_counter()
@@ -81,14 +110,24 @@ class RAGEngine:
                 question=question,
                 doc_ids=doc_ids,
                 top_k=top_k,
+                history=history or [],
+                owner_id=owner_id,
             )
         except Exception:
             logger.exception("LangGraph query failed")
             raise
 
         chunks = result.get("chunks", [])
-        answer = result.get("answer", "")
+        answer = normalize_citations(result.get("answer", ""))
         error = result.get("error")
+        # Confidence reflects retrieval quality of everything retrieved, while the
+        # sources shown to the user are limited to the ones the answer cites.
+        confidence = self._assess_confidence(chunks)
+        retrieved_count = len(chunks)
+        if is_refusal(answer):
+            chunks, confidence = [], "LOW"  # a refusal is not backed by any source
+        else:
+            chunks = select_cited_chunks(answer, chunks)
 
         if not chunks and not answer:
             answer = (
@@ -100,11 +139,7 @@ class RAGEngine:
             Source(
                 doc_name=chunk.get("doc_name", ""),
                 page_number=chunk.get("page_number", 0),
-                text=(
-                    chunk.get("text", "")[:300] + "..."
-                    if len(chunk.get("text", "")) > 300
-                    else chunk.get("text", "")
-                ),
+                text=excerpt(chunk.get("text", "")),
                 similarity=float(chunk.get("similarity", 0.0)),
             )
             for chunk in chunks
@@ -120,12 +155,12 @@ class RAGEngine:
             latency_ms=round(latency_ms, 1),
             chunks_retrieved=len(chunks),
             is_grounded=bool(result.get("is_grounded", False)),
-            confidence=self._assess_confidence(chunks),
+            confidence=confidence,
         )
 
         logger.info(
             f"LangGraph query complete | latency={latency_ms:.0f}ms | "
-            f"chunks={len(chunks)} | grounded={response.is_grounded} | "
+            f"chunks={len(chunks)}/{retrieved_count} | grounded={response.is_grounded} | "
             f"error={error or 'none'}"
         )
 

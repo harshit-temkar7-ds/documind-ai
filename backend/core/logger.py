@@ -5,7 +5,6 @@ Provides consistent structured logging across all modules.
 
 import logging
 import sys
-from datetime import datetime
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -16,9 +16,10 @@ Why RecursiveCharacterTextSplitter?
 import fitz  # PyMuPDF
 import re
 import hashlib
+import tiktoken
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from backend.core import settings, get_logger
@@ -59,10 +60,18 @@ class PDFProcessor:
     """
 
     def __init__(self):
+        self.encoding = self._load_encoding()
+        if settings.chunk_unit == "chars":
+            length_fn = len
+        elif self.encoding is not None:
+            length_fn = lambda value: len(self.encoding.encode(value))  # noqa: E731
+        else:
+            # Offline fallback: ~4 characters per token.
+            length_fn = lambda value: max(1, len(value) // 4)  # noqa: E731
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=settings.chunk_size,
             chunk_overlap=settings.chunk_overlap,
-            length_function=len,
+            length_function=length_fn,
             # Try splitting on paragraphs → newlines → sentences → words
             separators=["\n\n", "\n", ". ", "? ", "! ", " ", ""],
         )
@@ -71,10 +80,30 @@ class PDFProcessor:
             f"overlap={settings.chunk_overlap}"
         )
 
-    def _generate_doc_id(self, filename: str, file_size: int) -> str:
-        """Generate a deterministic unique ID for a document."""
-        raw = f"{filename}_{file_size}"
-        return hashlib.md5(raw.encode()).hexdigest()[:12]
+    @staticmethod
+    def _load_encoding():
+        """tiktoken downloads its vocabulary on first use; fall back if that is impossible."""
+        try:
+            return tiktoken.get_encoding("cl100k_base")
+        except Exception as exc:  # network blocked, cache not writable, ...
+            logger.warning(
+                f"tiktoken encoding unavailable ({exc}); using ~4 chars/token estimate"
+            )
+            return None
+
+    @property
+    def _overlap_chars(self) -> int:
+        """Cross-page overlap expressed in characters (tokens are ~4 chars)."""
+        factor = 1 if settings.chunk_unit == "chars" else 4
+        return settings.chunk_overlap * factor
+
+    def _generate_doc_id(self, path: Path) -> str:
+        """Hash incrementally to avoid reading the complete PDF into memory."""
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()[:16]
 
     def _clean_text(self, text: str) -> str:
         """
@@ -93,27 +122,49 @@ class PDFProcessor:
         text = re.sub(r"^\s*\d+\s*$", "", text, flags=re.MULTILINE)
         return text.strip()
 
-    def _extract_text_by_page(self, pdf_path: str) -> List[dict]:
+    def _extract_text_by_page(self, pdf_path: str):
         """
         Extract text from each page individually.
-        Returns list of {page_number, text} dicts.
+        Returns (pages, total_pages) where pages is a list of {page_number, text}
+        dicts (empty pages skipped) and total_pages is the real PDF page count.
         """
         pages = []
-        doc = fitz.open(pdf_path)
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as exc:
+            raise ValueError("Invalid or unreadable PDF file.") from exc
 
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            text = page.get_text("text")  # plain text extraction
-            cleaned = self._clean_text(text)
-            if cleaned:  # skip empty pages
-                pages.append({
-                    "page_number": page_num + 1,  # 1-indexed
-                    "text": cleaned
-                })
+        ocr_enabled = True  # switched off after the first OCR failure (e.g. no Tesseract)
+        try:
+            total_pages = len(doc)
+            for page_num in range(total_pages):
+                page = doc[page_num]
+                cleaned = self._clean_text(page.get_text("text", sort=True))
+                if not cleaned and ocr_enabled:
+                    try:
+                        cleaned = self._ocr_page(page)
+                    except Exception as exc:  # ImportError, TesseractNotFoundError, ...
+                        ocr_enabled = False
+                        logger.warning(f"OCR unavailable, skipping scanned pages: {exc}")
+                if cleaned:  # skip empty pages
+                    pages.append({
+                        "page_number": page_num + 1,  # 1-indexed
+                        "text": cleaned
+                    })
+        finally:
+            doc.close()
 
-        doc.close()
-        logger.info(f"Extracted {len(pages)} pages from {Path(pdf_path).name}")
-        return pages
+        logger.info(f"Extracted {len(pages)} text pages from {Path(pdf_path).name}")
+        return pages, total_pages
+
+    def _ocr_page(self, page) -> str:
+        """OCR one page (needs the pytesseract package and the Tesseract binary)."""
+        import io
+        import pytesseract
+        from PIL import Image
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        text = pytesseract.image_to_string(Image.open(io.BytesIO(pix.tobytes("png"))))
+        return self._clean_text(text)
 
     def process(self, pdf_path: str) -> ProcessedDocument:
         """
@@ -128,24 +179,26 @@ class PDFProcessor:
         path = Path(pdf_path)
         filename = path.name
         file_size_kb = path.stat().st_size / 1024
-        doc_id = self._generate_doc_id(filename, int(file_size_kb))
+        doc_id = self._generate_doc_id(path)
 
         logger.info(f"Processing PDF: {filename} ({file_size_kb:.1f} KB)")
 
         # Step 1: Extract text page by page
-        pages = self._extract_text_by_page(pdf_path)
+        pages, total_pages = self._extract_text_by_page(pdf_path)
         if not pages:
             raise ValueError(f"No extractable text found in {filename}. "
-                             "File may be scanned/image-only.")
-
-        total_pages = pages[-1]["page_number"] if pages else 0
+                             "File may be scanned/image-only (OCR needs Tesseract installed).")
 
         # Step 2: Chunk each page separately (preserves page metadata)
         all_chunks: List[DocumentChunk] = []
         chunk_index = 0
 
+        previous_tail = ""
         for page_data in pages:
-            page_chunks = self.splitter.split_text(page_data["text"])
+            overlap = min(self._overlap_chars, len(previous_tail))
+            page_text = (previous_tail[-overlap:] + "\n" if overlap else "") + page_data["text"]
+            page_chunks = self.splitter.split_text(page_text)
+            previous_tail = page_data["text"][-self._overlap_chars:]
 
             for chunk_text in page_chunks:
                 if len(chunk_text.strip()) < 20:  # skip trivially short chunks

@@ -17,6 +17,9 @@ const state = {
   documents:      [],       // all indexed documents
   selectedDocIds: [],       // filter queries to these docs (empty = all)
   isQuerying:     false,    // prevent double-submit
+  apiKey:         '',
+  authPrompted:   false,
+  history:        [],
 };
 
 // ── DOM References ─────────────────────────────────────────────────────────────
@@ -45,13 +48,17 @@ const dom = {
 async function apiFetch(endpoint, options = {}) {
   const url = `${API_BASE}${endpoint}`;
   try {
-    const res = await fetch(url, {
-      headers: { 'Content-Type': 'application/json', ...options.headers },
-      ...options,
-    });
+    const headers = { 'Content-Type': 'application/json', ...options.headers };
+    if (state.apiKey) headers['X-API-Key'] = state.apiKey;
+    let res = await fetch(url, { ...options, headers });
+    if (res.status === 401 && !state.authPrompted) {
+      state.authPrompted = true;
+      state.apiKey = prompt('Enter the DocuMind API key:') || '';
+      if (state.apiKey) res = await fetch(url, { ...options, headers: { ...headers, 'X-API-Key': state.apiKey } });
+    }
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || `HTTP ${res.status}`);
+      throw new Error(formatError(err.detail, `HTTP ${res.status}`));
     }
     return await res.json();
   } catch (err) {
@@ -60,6 +67,42 @@ async function apiFetch(endpoint, options = {}) {
     }
     throw err;
   }
+}
+
+async function streamQuery(payload, onToken) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (state.apiKey) headers['X-API-Key'] = state.apiKey;
+  let response = await fetch(`${API_BASE}/api/query/stream`, {
+    method: 'POST', headers, body: JSON.stringify(payload),
+  });
+  if (response.status === 401 && !state.authPrompted) {
+    state.authPrompted = true;
+    state.apiKey = prompt('Enter the DocuMind API key:') || '';
+    if (state.apiKey) response = await fetch(`${API_BASE}/api/query/stream`, {
+      method: 'POST', headers: { ...headers, 'X-API-Key': state.apiKey }, body: JSON.stringify(payload),
+    });
+  }
+  if ([404, 405, 501].includes(response.status)) return null;
+  if (!response.ok || !response.body) return null;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '', finalData = null, answer = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const events = buffer.split(/\r?\n\r?\n/);
+    buffer = events.pop() || '';
+    for (const event of events) {
+      const type = event.match(/^event:\s*(.+)$/m)?.[1];
+      const dataLine = event.match(/^data:\s*(.+)$/m)?.[1];
+      if (!dataLine) continue;
+      const data = JSON.parse(dataLine);
+      if (type === 'token') { answer += data.token || ''; onToken(answer); }
+      if (type === 'final') finalData = data;
+    }
+    if (done) break;
+  }
+  return finalData;
 }
 
 
@@ -71,7 +114,7 @@ function showToast(message, type = 'info', duration = 4000) {
   toast.className = `toast ${type}`;
   toast.innerHTML = `
     <span class="toast-icon">${icons[type]}</span>
-    <span class="toast-msg">${message}</span>
+    <span class="toast-msg">${escapeHtml(message)}</span>
   `;
   dom.toastContainer.appendChild(toast);
   setTimeout(() => {
@@ -130,20 +173,34 @@ function renderDocumentList() {
 
   dom.docList.innerHTML = docs.map(doc => `
     <div class="doc-item ${state.selectedDocIds.includes(doc.doc_id) ? 'selected' : ''}"
-         onclick="toggleDocSelection('${doc.doc_id}')"
-         title="${doc.filename}">
+         data-doc-id="${escapeHtml(doc.doc_id)}"
+         title="${escapeHtml(doc.filename)}">
       <div class="doc-icon">📄</div>
       <div class="doc-info">
-        <div class="doc-name">${doc.filename}</div>
+        <div class="doc-name">${escapeHtml(doc.filename)}</div>
         <div class="doc-meta">${doc.total_pages} pages · ${doc.total_chunks} chunks · ${doc.file_size_kb.toFixed(1)} KB</div>
       </div>
-      <button class="doc-delete"
-              onclick="deleteDocument(event, '${doc.doc_id}', '${doc.filename}')"
+      <button class="doc-delete" data-action="delete"
               title="Remove document">✕</button>
     </div>
   `).join('');
 
   renderDocFilter();
+}
+
+function setupDocList() {
+  // One delegated listener instead of inline onclick attributes (no JS in HTML strings).
+  dom.docList.addEventListener('click', event => {
+    const item = event.target.closest('.doc-item');
+    if (!item) return;
+    const docId = item.dataset.docId;
+    if (event.target.closest('[data-action="delete"]')) {
+      const doc = state.documents.find(d => d.doc_id === docId);
+      deleteDocument(event, docId, doc ? doc.filename : docId);
+    } else {
+      toggleDocSelection(docId);
+    }
+  });
 }
 
 function toggleDocSelection(docId) {
@@ -164,7 +221,7 @@ function renderDocFilter() {
 
   const names = state.selectedDocIds.map(id => {
     const doc = state.documents.find(d => d.doc_id === id);
-    return doc ? `<span class="doc-filter-chip">📄 ${doc.filename}</span>` : '';
+    return doc ? `<span class="doc-filter-chip">📄 ${escapeHtml(doc.filename)}</span>` : '';
   }).join('');
 
   dom.docFilter.innerHTML = `
@@ -249,19 +306,43 @@ async function handleUpload(file) {
       if (progress > 75)  dom.progressLabel.textContent = 'Indexing chunks...';
     }, 400);
 
-    const result = await fetch(`${API_BASE}/api/upload`, {
+    let result = await fetch(`${API_BASE}/api/upload`, {
       method: 'POST',
       body: formData,
+      headers: state.apiKey ? { 'X-API-Key': state.apiKey } : {},
     });
+
+    if (result.status === 401 && !state.authPrompted) {
+      state.authPrompted = true;
+      state.apiKey = prompt('Enter the DocuMind API key:') || '';
+      if (state.apiKey) {
+        const retry = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: formData,
+          headers: { 'X-API-Key': state.apiKey } });
+        if (!retry.ok) throw new Error(formatError((await retry.json()).detail, 'Upload failed'));
+        result = retry;
+      } else throw new Error('API key is required.');
+    }
 
     clearInterval(progressInterval);
 
     if (!result.ok) {
       const err = await result.json();
-      throw new Error(err.detail || 'Upload failed');
+      throw new Error(formatError(err.detail, 'Upload failed'));
     }
 
     const data = await result.json();
+
+    if (data.job_id) {
+      dom.progressLabel.textContent = 'Queued for processing...';
+      let job;
+      do {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        job = await apiFetch(`/api/jobs/${encodeURIComponent(data.job_id)}`);
+        dom.progressLabel.textContent = job.status === 'processing' ? 'Processing PDF...' : 'Queued for processing...';
+      } while (job.status === 'queued' || job.status === 'processing');
+      if (job.status !== 'done') throw new Error(job.error || 'Background processing failed.');
+      data.message = `Indexed ${job.total_chunks} chunks across ${job.total_pages} pages.`;
+    }
 
     dom.progressBar.style.width = '100%';
     dom.progressLabel.textContent = 'Complete!';
@@ -333,15 +414,27 @@ async function sendQuery() {
     const payload = {
       question,
       doc_ids: state.selectedDocIds.length > 0 ? state.selectedDocIds : null,
+      history: state.history.slice(-10).map(t => ({ role: t.role, content: String(t.content).slice(0, 4000) })),
     };
 
-    const data = await apiFetch('/api/query', {
-      method: 'POST',
-      body: JSON.stringify(payload),
+    let streamed = false;
+    let data;
+    try {
+      data = await streamQuery(payload, partial => {
+        streamed = true;
+        const indicator = typingEl.querySelector('.typing-indicator');
+        if (indicator) indicator.textContent = partial;
+      });
+    } catch (streamError) {
+      if (streamed) throw streamError;
+    }
+    if (!data) data = await apiFetch('/api/query', {
+      method: 'POST', body: JSON.stringify(payload),
     });
 
     typingEl.remove();
     appendAssistantMessage(data);
+    state.history.push({ role: 'user', content: question }, { role: 'assistant', content: data.answer });
 
   } catch (err) {
     typingEl.remove();
@@ -394,11 +487,11 @@ function appendAssistantMessage(data) {
   wrap.innerHTML = `
     <div class="msg-label">DocuMind AI</div>
     <div class="msg-bubble">
-      <div style="white-space:pre-wrap;word-wrap:break-word">${escapeHtml(data.answer)}</div>
+      <div class="md-body">${renderMarkdown(data.answer)}</div>
       <div class="answer-meta">
         <span class="meta-badge ${confClass}">${confLabel}</span>
         ${groundedBadge}
-        <span class="meta-badge badge-blue">🔍 ${data.chunks_retrieved} sources</span>
+        <span class="meta-badge badge-blue">🔍 ${data.chunks_retrieved} ${data.chunks_retrieved === 1 ? 'source' : 'sources'}</span>
         <span class="meta-badge badge-purple">⚡ ${data.model_used}</span>
         <span class="meta-badge badge-gray">⏱ ${data.latency_ms}ms</span>
       </div>
@@ -466,6 +559,14 @@ function scrollToBottom() {
   dom.chatArea.scrollTop = dom.chatArea.scrollHeight;
 }
 
+function formatError(detail, fallback) {
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail.map(d => (d && d.msg) ? d.msg : String(d)).join('; ') || fallback;
+  }
+  return fallback;
+}
+
 function escapeHtml(text) {
   return String(text)
     .replace(/&/g, '&amp;')
@@ -488,6 +589,7 @@ function askSample(question) {
 
 async function init() {
   setupUpload();
+  setupDocList();
   setupChat();
   await checkHealth();
   await loadDocuments();

@@ -120,3 +120,12 @@ def test_retrieval_gate_generates_for_sufficient_similarity():
     }
 
     assert DocuMindRAGGraph.route_after_retrieval(state) == "generate"
+
+
+def test_refusal_is_never_grounded():
+    graph = object.__new__(DocuMindRAGGraph)
+    result = graph.check_evidence({
+        "answer": "The document does not contain that information.",
+        "chunks": [{"text": "The document contains many important facts."}],
+    })
+    assert result["is_grounded"] is False

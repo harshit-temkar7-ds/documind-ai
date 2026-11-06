@@ -1,32 +1,24 @@
-# ── Core API ──────────────────────────────────────────────────────────────────
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
-python-multipart==0.0.9
-pydantic==2.7.1
-pydantic-settings==2.2.1
-
-# ── PDF Processing ────────────────────────────────────────────────────────────
-pymupdf==1.24.3          # fast PDF text extraction (fitz)
-
-# ── NLP / Embeddings ──────────────────────────────────────────────────────────
-sentence-transformers==2.7.0   # local embeddings (all-MiniLM-L6-v2)
-langchain==0.1.20
-langchain-community==0.0.38
-langchain-text-splitters==0.0.2
-
-# ── Vector Store ──────────────────────────────────────────────────────────────
-chromadb==0.5.0          # persistent local vector DB
-        # fast similarity search
-
-# ── LLM API ───────────────────────────────────────────────────────────────────
-groq==0.6.0              # Groq API (free, blazing fast llama3)
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# Runtime dependencies. Tested with Python 3.10 - 3.12 (NOT 3.13/3.14: torch 2.5.1 has no wheels).
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.4
+pydantic-settings==2.7.1
+pymupdf==1.25.1
+sentence-transformers==3.3.1
+torch==2.5.1
+langchain-text-splitters==0.3.5
+langchain-core==0.3.29
+langchain-groq==0.2.3
+langgraph==0.2.62
+chromadb==0.6.3
+faiss-cpu==1.9.0.post1   # similarity search (wheels for Python 3.10-3.12, incl. Windows)
+posthog==3.11.0   # chromadb 0.6.3 breaks with posthog>=6 (telemetry error spam)
+groq==0.15.0
 python-dotenv==1.0.1
-aiofiles==23.2.1
 numpy==1.26.4
-tiktoken==0.7.0          # token counting
-
-# ── Dev ───────────────────────────────────────────────────────────────────────
-pytest==8.2.0
-httpx==0.27.0            # test FastAPI
+tiktoken==0.8.0
+rank-bm25==0.2.2
+Pillow==11.1.0
+pytesseract==0.3.13
+huggingface-hub==0.27.1

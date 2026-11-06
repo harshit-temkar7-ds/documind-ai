@@ -5,7 +5,7 @@ These enforce type safety and auto-generate OpenAPI docs.
 """
 
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 
 # ── Upload ─────────────────────────────────────────────────────────────────────
@@ -18,6 +18,8 @@ class UploadResponse(BaseModel):
     total_chunks: int
     file_size_kb: float
     message:      str
+    job_id:       Optional[str] = None
+    status:       Optional[str] = None
 
 
 # ── Documents ──────────────────────────────────────────────────────────────────
@@ -42,12 +44,18 @@ class DeleteResponse(BaseModel):
 
 # ── Query ──────────────────────────────────────────────────────────────────────
 
+class ChatTurn(BaseModel):
+    """One earlier chat message, used only to resolve follow-up questions."""
+    role: Literal["user", "assistant"]
+    content: str = Field(..., max_length=4000)
+
+
 class QueryRequest(BaseModel):
     question: str = Field(
         ...,
         min_length=3,
         max_length=1000,
-        example="What are the main findings of this document?"
+        examples=["What are the main findings of this document?"]
     )
     doc_ids: Optional[List[str]] = Field(
         default=None,
@@ -58,6 +66,11 @@ class QueryRequest(BaseModel):
         ge=1,
         le=20,
         description="Number of chunks to retrieve. Defaults to setting in .env"
+    )
+    history: Optional[List[ChatTurn]] = Field(
+        default=None,
+        max_length=10,
+        description="Up to 10 recent chat turns used to resolve follow-up questions.",
     )
 
 
@@ -89,3 +102,4 @@ class HealthResponse(BaseModel):
     embedding_model: str
     documents_count: int
     groq_configured: bool
+    vector_backend:  str = "chroma"

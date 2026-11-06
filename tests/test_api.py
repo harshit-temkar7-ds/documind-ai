@@ -3,9 +3,7 @@ DocuMind AI — API Integration Tests
 Run: pytest tests/ -v
 """
 
-import pytest
 import os
-from pathlib import Path
 from fastapi.testclient import TestClient
 
 # Set test environment
@@ -56,12 +54,11 @@ class TestDocuments:
             "/api/upload",
             files={"file": ("empty.pdf", minimal_pdf, "application/pdf")}
         )
-        # Should either succeed or return 422 (no text) — not 500
-        assert res.status_code in [200, 422]
+        assert res.status_code == 422
 
     def test_delete_nonexistent_document(self):
         res = client.delete("/api/documents/nonexistent_id")
-        assert res.status_code in [404, 400]
+        assert res.status_code == 404
 
 
 class TestQuery:
@@ -70,8 +67,7 @@ class TestQuery:
             "/api/query",
             json={"question": "What is this about?"}
         )
-        # Should get 404 (no docs) or 200 (with "no docs" message)
-        assert res.status_code in [200, 404]
+        assert res.status_code == 404
 
     def test_query_short_question_rejected(self):
         res = client.post(

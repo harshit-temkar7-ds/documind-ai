@@ -3,7 +3,7 @@ DocuMind AI — Embedding Service
 ─────────────────────────────────
 Uses sentence-transformers to convert text → dense vectors.
 
-Model: paraphrase-MiniLM-L3-v2
+Model: settings.embedding_model
   - 384-dimensional vectors
   - Runs fully locally (no API key needed)
   - 80MB model, ~5ms per sentence on CPU
@@ -18,12 +18,11 @@ Why local embeddings?
 
 import numpy as np
 import torch
-torch.set_num_threads(1)
 from typing import List
 from sentence_transformers import SentenceTransformer
-from functools import lru_cache
-
 from backend.core import settings, get_logger
+
+torch.set_num_threads(settings.torch_threads)
 
 logger = get_logger(__name__)
 

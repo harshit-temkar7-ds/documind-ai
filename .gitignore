@@ -62,6 +62,8 @@ logs/
 data/uploads/*
 !data/uploads/.gitkeep
 data/vectorstore/
+data/**/chroma.sqlite3
+notebooks/data/vectorstore/chroma.sqlite3
 data/test_uploads/
 data/test_vectorstore/
 

@@ -1,248 +1,256 @@
-"""
-DocuMind AI — API Routes
-─────────────────────────
-Endpoints:
-  POST /api/upload          → Upload + index a PDF
-  GET  /api/documents       → List all indexed documents
-  DELETE /api/documents/{id}→ Remove a document
-  POST /api/query           → Ask a question (RAG pipeline)
-  GET  /api/health          → Health check
-  GET  /                    → Serve the HTML frontend
-"""
-
+"""Public API endpoints; response schemas remain backwards compatible."""
+import hashlib
+import json
 import os
-import shutil
+import re
+import secrets
+import time
+import uuid
 from pathlib import Path
-from typing import List
-
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
-from fastapi.responses import HTMLResponse, FileResponse
-
+from typing import Optional
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from backend.core import settings, get_logger
-from backend.services import (
-    PDFProcessor, get_vector_store, get_rag_engine
-)
-from backend.api.schemas import (
-    UploadResponse, DocumentInfo, DocumentListResponse,
-    DeleteResponse, QueryRequest, QueryResponse,
-    SourceInfo, HealthResponse
-)
+from backend.services import PDFProcessor, get_vector_store, get_rag_engine
+from backend.services.rag_engine import excerpt, normalize_citations, select_cited_chunks
+from backend.services.rag_graph import NO_EVIDENCE_ANSWER, SYSTEM_PROMPT, is_refusal
+from backend.api.schemas import (UploadResponse, DocumentInfo, DocumentListResponse,
+    DeleteResponse, QueryRequest, QueryResponse, SourceInfo, HealthResponse)
 
 logger = get_logger(__name__)
 router = APIRouter()
+MAX_UPLOAD = 50 * 1024 * 1024
+BACKGROUND_THRESHOLD = 10 * 1024 * 1024  # larger PDFs are indexed in the background
+jobs = {}
+JOB_TTL_SECONDS = 3600  # finished jobs are forgotten after one hour
 
-# Lazy singletons
-def _processor():  return PDFProcessor()
-def _store():      return get_vector_store()
-def _engine():     return get_rag_engine()
+
+def _prune_jobs() -> None:
+    """Drop old finished jobs so the in-memory registry cannot grow forever."""
+    cutoff = time.time() - JOB_TTL_SECONDS
+    for job_id in [j for j, v in jobs.items()
+                   if v.get("status") in ("done", "failed") and v.get("created", 0) < cutoff]:
+        jobs.pop(job_id, None)
 
 
-# ── Health Check ───────────────────────────────────────────────────────────────
+def _history(request: "QueryRequest") -> list:
+    return [turn.model_dump() for turn in (request.history or [])]
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> Optional[str]:
+    if not settings.api_key:
+        return None
+    if not x_api_key or not secrets.compare_digest(x_api_key, settings.api_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return hashlib.sha256(x_api_key.encode()).hexdigest()
+
+def _store(): return get_vector_store()
+def _safe_name(name: str) -> str:
+    name = Path(name or "document.pdf").name
+    name = re.sub(r"[^A-Za-z0-9._ -]", "_", name).strip(" .")
+    return (name or "document.pdf")[:180]
+
+def _ingest_file(path: Path, filename: str, owner: Optional[str]):
+    """Process + index a PDF. Returns (processed_document, already_indexed)."""
+    processed = PDFProcessor().process(str(path))
+    processed.filename = filename
+    for chunk in processed.chunks:
+        chunk.doc_name = filename
+        chunk.metadata["source"] = filename
+    store = _store()
+    if store.document_exists(processed.doc_id, owner):
+        return processed, True
+    if owner is not None and store.document_exists(processed.doc_id):
+        raise HTTPException(409, "This PDF content is already indexed.")
+    destination = Path(settings.upload_folder) / f"{processed.doc_id}.pdf"
+    os.replace(path, destination)
+    try:
+        if not store.index_document(processed, owner or ""):
+            destination.unlink(missing_ok=True)
+            raise ValueError("PDF contains no indexable text.")
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    return processed, False
+
+async def _run_ingest_job(job_id: str, path: Path, filename: str, owner: str):
+    jobs[job_id]["status"] = "processing"
+    try:
+        processed, _ = await run_in_threadpool(_ingest_file, path, filename, owner)
+        jobs[job_id].update(status="done", doc_id=processed.doc_id,
+            total_pages=processed.total_pages, total_chunks=processed.total_chunks)
+    except ValueError as exc:
+        jobs[job_id].update(status="failed", error=str(exc))
+    except Exception:
+        logger.exception("Background ingestion failed | job_id=%s", job_id)
+        jobs[job_id].update(status="failed", error="Ingestion failed. See server logs.")
+    finally:
+        path.unlink(missing_ok=True)
 
 @router.get("/api/health", response_model=HealthResponse, tags=["System"])
-async def health_check():
-    """Check API status, model availability, and document count."""
+def health_check():
     store = _store()
-    docs  = store.list_documents()
-
-    return HealthResponse(
-        status="healthy",
-        app_name=settings.app_name,
-        version=settings.app_version,
-        model=settings.llm_model,
-        embedding_model=settings.embedding_model,
-        documents_count=len(docs),
-        groq_configured=bool(settings.GROQ_API_KEY),    )
-
-
-# ── Document Upload ────────────────────────────────────────────────────────────
+    docs = store.list_documents()
+    return HealthResponse(status="healthy", app_name=settings.app_name, version=settings.app_version,
+        model=settings.llm_model, embedding_model=settings.embedding_model,
+        documents_count=len(docs), groq_configured=bool(settings.GROQ_API_KEY),
+        vector_backend=getattr(store, "backend", "chroma"))
 
 @router.post("/api/upload", response_model=UploadResponse, tags=["Documents"])
-async def upload_pdf(file: UploadFile = File(...)):
-    """
-    Upload a PDF file, extract text, chunk it, embed it, and store in vector DB.
-
-    Process:
-      1. Validate file type (PDF only)
-      2. Save to uploads folder
-      3. Extract text via PyMuPDF
-      4. Split into overlapping chunks
-      5. Embed all chunks (sentence-transformers)
-      6. Store in ChromaDB
-    """
-    # Validate file type
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are supported. Please upload a .pdf file."
-        )
-
-    # Validate file size (max 50MB)
-    MAX_SIZE = 50 * 1024 * 1024
-    content = await file.read()
-    if len(content) > MAX_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail="File too large. Maximum size is 50MB."
-        )
-
-    # Save file to uploads folder (use basename to prevent path traversal)
-    safe_filename = Path(file.filename).name
-    upload_path = Path(settings.upload_folder) / safe_filename
-    with open(upload_path, "wb") as f:
-        f.write(content)
-
-    logger.info(f"File saved: {upload_path}")
-
+async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...),
+                     owner: str = Depends(require_api_key)):
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are supported.")
+    folder = Path(settings.upload_folder); folder.mkdir(parents=True, exist_ok=True)
+    staging = folder / f".{uuid.uuid4().hex}.tmp"
+    size = 0
     try:
-        # Process PDF
-        processor = _processor()
-        processed_doc = processor.process(str(upload_path))
-
-        # Check if already indexed
-        store = _store()
-        if store.document_exists(processed_doc.doc_id):
-            logger.info(f"Document already indexed: {file.filename}")
-            return UploadResponse(
-                success=True,
-                doc_id=processed_doc.doc_id,
-                filename=processed_doc.filename,
-                total_pages=processed_doc.total_pages,
-                total_chunks=processed_doc.total_chunks,
-                file_size_kb=processed_doc.file_size_kb,
-                message=f"'{file.filename}' was already indexed. Ready to query!"
-            )
-
-        # Index in vector store
-        store.index_document(processed_doc)
-
-        return UploadResponse(
-            success=True,
-            doc_id=processed_doc.doc_id,
-            filename=processed_doc.filename,
-            total_pages=processed_doc.total_pages,
-            total_chunks=processed_doc.total_chunks,
-            file_size_kb=processed_doc.file_size_kb,
-            message=(
-                f"'{file.filename}' uploaded successfully! "
-                f"{processed_doc.total_chunks} chunks indexed across "
-                f"{processed_doc.total_pages} pages."
-            )
-        )
-
-    except ValueError as e:
-        # PDF has no extractable text (scanned/image PDF)
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        logger.error(f"Upload failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
-
-
-# ── List Documents ─────────────────────────────────────────────────────────────
+        with staging.open("wb") as output:
+            first = await file.read(5)
+            if not first: raise HTTPException(400, "Empty files are not accepted.")
+            if first != b"%PDF-": raise HTTPException(400, "Invalid PDF file signature.")
+            output.write(first); size += len(first)
+            while block := await file.read(1024 * 1024):
+                size += len(block)
+                if size > MAX_UPLOAD: raise HTTPException(400, "File too large. Maximum size is 50MB.")
+                output.write(block)
+        if size <= 5: raise HTTPException(400, "Empty PDF files are not accepted.")
+        safe_filename = _safe_name(file.filename)
+        if size >= BACKGROUND_THRESHOLD:
+            job_id = uuid.uuid4().hex
+            pending = folder / f".{job_id}.pending"
+            os.replace(staging, pending)
+            staging = None
+            _prune_jobs()
+            jobs[job_id] = {"status": "queued", "owner_id": owner, "created": time.time()}
+            background_tasks.add_task(_run_ingest_job, job_id, pending, safe_filename, owner)
+            return UploadResponse(success=True, doc_id="", filename=safe_filename,
+                total_pages=0, total_chunks=0, file_size_kb=round(size/1024, 2),
+                message="Upload accepted for background processing.", job_id=job_id, status="queued")
+        processed, already_indexed = await run_in_threadpool(
+            _ingest_file, staging, safe_filename, owner)
+        if already_indexed:
+            existing = next((d for d in _store().list_documents(owner)
+                             if d["doc_id"] == processed.doc_id), None)
+            return UploadResponse(success=True, doc_id=processed.doc_id,
+                filename=existing["filename"] if existing else processed.filename,
+                total_pages=processed.total_pages, total_chunks=processed.total_chunks,
+                file_size_kb=processed.file_size_kb, message="Document already indexed.")
+        return UploadResponse(success=True, doc_id=processed.doc_id, filename=processed.filename,
+            total_pages=processed.total_pages, total_chunks=processed.total_chunks,
+            file_size_kb=processed.file_size_kb, message=f"'{processed.filename}' uploaded successfully!")
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception:
+        logger.exception("Upload processing failed")
+        raise HTTPException(500, "Upload processing failed. See server logs for details.") from None
+    finally:
+        if staging is not None: staging.unlink(missing_ok=True)
+        await file.close()
 
 @router.get("/api/documents", response_model=DocumentListResponse, tags=["Documents"])
-async def list_documents():
-    """Return all indexed documents with metadata."""
-    store = _store()
-    docs  = store.list_documents()
-    return DocumentListResponse(
-        documents=[DocumentInfo(**d) for d in docs],
-        total=len(docs)
-    )
-
-
-# ── Delete Document ────────────────────────────────────────────────────────────
+def list_documents(owner: str = Depends(require_api_key)):
+    docs = _store().list_documents(owner)
+    return DocumentListResponse(documents=[DocumentInfo(**d) for d in docs], total=len(docs))
 
 @router.delete("/api/documents/{doc_id}", response_model=DeleteResponse, tags=["Documents"])
-async def delete_document(doc_id: str):
-    """Remove a document and all its embeddings from the vector store."""
+def delete_document(doc_id: str, owner: str = Depends(require_api_key)):
     store = _store()
+    doc = next((d for d in store.list_documents(owner) if d["doc_id"] == doc_id), None)
+    if not doc or not store.delete_document(doc_id, owner): raise HTTPException(404, f"Document '{doc_id}' not found.")
+    (Path(settings.upload_folder) / f"{doc_id}.pdf").unlink(missing_ok=True)
+    return DeleteResponse(success=True, message=f"Document '{doc_id}' removed successfully.")
 
-    # Fetch filename BEFORE deleting so we can clean up the physical file
-    all_docs = store.list_documents()
-    doc_meta = next((d for d in all_docs if d["doc_id"] == doc_id), None)
-
-    success = store.delete_document(doc_id)
-
-    if not success:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Document '{doc_id}' not found."
-        )
-
-    # Remove the physical PDF file from uploads if it exists
-    if doc_meta:
-        file_path = Path(settings.upload_folder) / doc_meta["filename"]
-        if file_path.exists():
-            try:
-                file_path.unlink()
-                logger.info(f"Deleted file from disk: {file_path}")
-            except Exception as e:
-                logger.warning(f"Could not delete file {file_path}: {e}")
-
-    return DeleteResponse(
-        success=True,
-        message=f"Document '{doc_id}' removed successfully."
-    )
-
-
-# ── RAG Query ──────────────────────────────────────────────────────────────────
+@router.get("/api/jobs/{job_id}", tags=["Documents"])
+def get_job_status(job_id: str, owner: str = Depends(require_api_key)):
+    job = jobs.get(job_id)
+    if not job or job.get("owner_id") != owner:
+        raise HTTPException(404, "Job not found.")
+    return {key: value for key, value in job.items() if key not in ("owner_id", "created")}
 
 @router.post("/api/query", response_model=QueryResponse, tags=["Query"])
-async def query_documents(request: QueryRequest):
-    """
-    Ask a question about your uploaded documents.
+def query_documents(request: QueryRequest, owner: str = Depends(require_api_key)):
+    store = _store(); docs = store.list_documents(owner)
+    if not docs: raise HTTPException(404, "No documents indexed yet. Please upload a PDF first.")
+    allowed = {d["doc_id"] for d in docs}
+    if request.doc_ids and set(request.doc_ids) - allowed:
+        raise HTTPException(404, f"Documents not found: {list(set(request.doc_ids)-allowed)}")
+    result = get_rag_engine().query(request.question, request.doc_ids, request.top_k,
+                                    history=_history(request), owner_id=owner)
+    return QueryResponse(answer=result.answer, sources=[SourceInfo(doc_name=s.doc_name,
+        page_number=s.page_number, text=s.text, similarity=s.similarity) for s in result.sources],
+        query=result.query, model_used=result.model_used, latency_ms=result.latency_ms,
+        chunks_retrieved=result.chunks_retrieved, is_grounded=result.is_grounded, confidence=result.confidence)
 
-    The RAG pipeline:
-      1. Embeds your question
-      2. Retrieves top-K most similar chunks from vector store
-      3. Builds an augmented prompt (question + retrieved context)
-      4. Sends to Groq LLM for grounded answer generation
-      5. Returns answer + cited sources + confidence metrics
-    """
-    engine = _engine()
-    store  = _store()
+@router.post("/api/query/stream", tags=["Query"])
+def query_stream(request: QueryRequest, owner: str = Depends(require_api_key)):
+    """Stream Groq output tokens as SSE, followed by the regular response fields."""
+    store = _store()
+    docs = store.list_documents(owner)
+    if not docs: raise HTTPException(404, "No documents indexed yet. Please upload a PDF first.")
+    allowed = {d["doc_id"] for d in docs}
+    if request.doc_ids and set(request.doc_ids) - allowed:
+        raise HTTPException(404, "One or more requested documents were not found.")
+    graph = get_rag_engine().graph
+    history = _history(request)
+    question = request.question
+    if history:  # resolve follow-ups BEFORE retrieval so the right chunks are found
+        question = graph.condense_question(
+            {"question": request.question, "history": history}).get("question", request.question)
+    chunks = store.search(question, request.doc_ids,
+        request.top_k or settings.top_k_results, owner_id=owner)
+    start = time.perf_counter()
 
-    # Verify documents exist
-    all_docs = store.list_documents()
-    if not all_docs:
-        raise HTTPException(
-            status_code=404,
-            detail="No documents indexed yet. Please upload a PDF first."
-        )
+    def sse(event: str, payload: dict) -> str:
+        return f"event: {event}\ndata: " + json.dumps(payload) + "\n\n"
 
-    # Validate requested doc_ids
-    if request.doc_ids:
-        all_ids = {d["doc_id"] for d in all_docs}
-        invalid = set(request.doc_ids) - all_ids
-        if invalid:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Documents not found: {list(invalid)}"
-            )
+    if not chunks or max(c["similarity"] for c in chunks) < settings.retrieval_threshold:
+        def no_evidence_events():
+            yield sse("token", {"token": NO_EVIDENCE_ANSWER})
+            yield sse("final", {"answer": NO_EVIDENCE_ANSWER, "sources": [],
+                "query": request.question, "model_used": settings.llm_model,
+                "latency_ms": round((time.perf_counter() - start) * 1000, 1),
+                "chunks_retrieved": 0, "is_grounded": False, "confidence": "LOW"})
+        return StreamingResponse(no_evidence_events(), media_type="text/event-stream")
 
-    # Run RAG pipeline
-    rag_response = engine.query(
-        question=request.question,
-        doc_ids=request.doc_ids,
-        top_k=request.top_k,
-    )
+    context = "\n\n---\n\n".join(
+        f"[Source {i}: {c['doc_name']}, Page {c['page_number']}]\n{c['text']}"
+        for i, c in enumerate(chunks, 1))
 
-    return QueryResponse(
-        answer=rag_response.answer,
-        sources=[
-            SourceInfo(
-                doc_name=s.doc_name,
-                page_number=s.page_number,
-                text=s.text,
-                similarity=s.similarity,
-            )
-            for s in rag_response.sources
-        ],
-        query=rag_response.query,
-        model_used=rag_response.model_used,
-        latency_ms=rag_response.latency_ms,
-        chunks_retrieved=rag_response.chunks_retrieved,
-        is_grounded=rag_response.is_grounded,
-        confidence=rag_response.confidence,
-    )
+    def events():
+        from langchain_core.messages import HumanMessage, SystemMessage
+        answer = ""
+        if graph.llm is None:
+            answer = "GROQ_API_KEY is not configured. Add your key to the .env file."
+            yield sse("token", {"token": answer})
+        else:
+            messages = [SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=f"DOCUMENT CONTEXT:\n{context}\n\nQUESTION: {question}")]
+            try:
+                for part in graph.llm.stream(messages):
+                    token = part.content if isinstance(part.content, str) else ""
+                    if token:
+                        answer += token
+                        yield sse("token", {"token": token})
+            except Exception:
+                logger.exception("Streaming generation failed")
+                answer = "Answer generation failed. Please try again."
+                yield sse("token", {"token": answer})
+        answer = normalize_citations(answer)
+        grounded = graph.check_evidence({"chunks": chunks, "answer": answer}).get("is_grounded", False)
+        confidence = get_rag_engine()._assess_confidence(chunks)
+        if is_refusal(answer):
+            sources, confidence = [], "LOW"  # a refusal is not backed by any source
+        else:
+            sources = select_cited_chunks(answer, chunks)
+        yield sse("final", {"answer": answer,
+            "sources": [{"doc_name": c["doc_name"], "page_number": c["page_number"],
+                         "text": excerpt(c["text"]), "similarity": c["similarity"]} for c in sources],
+            "query": request.question, "model_used": settings.llm_model,
+            "latency_ms": round((time.perf_counter() - start) * 1000, 1),
+            "chunks_retrieved": len(sources), "is_grounded": grounded,
+            "confidence": confidence})
+    return StreamingResponse(events(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
